@@ -13,7 +13,7 @@ The core question was how classical stereo methods, which exploit known camera g
 Methods compared:
 - StereoBM
 - StereoSGBM
-- MiDaS-small
+- MiDaS Small
 - DPT-Large (pretrained MiDaS)
 - DepthAnything V2 Small
 - DPT-Large fine-tuned on KITTI
@@ -133,4 +133,80 @@ I spent a fair chunk of time tuning the parameters listed above, but still ended
 
 ---
 
-stay tuned for parts 4-11 discussing the rest of my process, coming very soon!
+## 4. Neural Depth Estimation
+
+Unlike stereo, monocular depth estimation takes a single image and predicts depth from learned visual cues like object size, perspective, texture gradients, and scene context. Without a second camera, there is no geometric constraint, so these models output relative depth rather than metric depth. Getting metric values requires an alignment step against ground truth.
+
+### 4.1 MiDaS Small - tested and discarded
+
+I included MiDaS small as a lightweight baseline to understand the accuracy tradeoff against model size. The raw output range of 0.002 to 0.025 is extremely compressed; after inversion, the depth maps showed almost no scene structure. MiDaS small is designed for real-time edge deployment and trades accuracy heavily for speed. Nonetheless, the comparison is still included in the notebook as it makes the DPT-Large improvement concrete.
+
+### 4.2 DPT-Large
+
+DPT-Large uses a Vision Transformer (ViT) backbone. Rather than processing through convolutional layers, ViT splits the image into 16x16 pixel patches and processes all 576 patches (for 384x384 input) simultaneously through transformer layers, where each patch attends to every other patch. This gives the model global context from the start, which is why it handles depth cues that depend on whole-scene context better than CNNs.
+
+I loaded it via `torch.hub.load("intel-isl/MiDaS", "DPT_Large")` with the corresponding `dpt_transform`, which resizes to 384x384 and normalizes with ImageNet statistics (`mean=[0.485, 0.456, 0.406]`, `std=[0.229, 0.224, 0.225]`). These normalization values match the model's pretraining and need to be preserved during fine-tuning as well.
+
+<img src="assets/midas_comparison.png" width="800">
+
+*MiDaS small vs DPT-Large on scene 0. MiDaS small (bottom left) shows almost no scene structure after alignment. DPT-Large (bottom right) correctly captures the road gradient and building positions.*
+
+### 4.3 DepthAnything V2 Small
+
+DepthAnything V2 is a newer model (2024) trained on a much larger and more diverse dataset than MiDaS. I loaded it through HuggingFace's `pipeline` interface. Despite being the Small variant, it outperforms pretrained DPT-Large on all metrics. Better training data and architectural improvements outweigh the size difference.
+
+### 4.4 Inverse depth
+
+Both DPT-Large and DepthAnything output inverse depth, not depth. High values mean close to the camera, while low values mean far away. This is the opposite of metric depth and needs to be handled before alignment or evaluation:
+
+```python
+depth = prediction.cpu().numpy()
+depth = np.clip(depth, 1e-3, None)
+depth = 1.0 / (depth + 1e-8)
+```
+
+The clip before inversion matters - near-zero raw values produce extremely large inverted values that break scale alignment. DepthAnything also has negative and near-zero values in its raw output from floating point noise, so clipping to 0.1 before inverting handles those cleanly.
+
+<img src="assets/da_raw.png" width="600">
+
+*Raw DepthAnything output before inversion and alignment. High values (yellow) correspond to close objects - the opposite of metric depth. The colorbar shows values up to around 10, which after inversion and scale alignment recover metric values.*
+
+### 4.5 Median scale alignment
+
+Since pretrained models output relative depth in arbitrary units, I aligned them to metric scale before computing metrics using median scale alignment, which is the standard approach in depth estimation literature:
+
+```python
+def median_scale_align(pred, gt):
+    mask = (gt > 0) & np.isfinite(gt) & np.isfinite(pred) & (pred > 0)
+    scale = np.median(gt[mask]) / np.median(pred[mask])
+    aligned = pred * scale
+    aligned = np.clip(aligned, 0, 80)
+    return aligned
+```
+
+The median predicted depth is scaled to match the median GT depth, giving a single global scale factor. Median is used rather than mean because it's robust to outliers.
+
+The main challenge was KITTI's sparse GT bias. The GT median is around 10m even though scenes extend to 80m, because sparse LiDAR hits nearby surfaces more densely than far ones. This means the scale factor gets calibrated against a close-biased reference, compressing far distances after alignment. I evaluated two alternatives - linear alignment fitting scale and shift via least squares, and fitting in inverse depth space - but both gave marginal improvements that I didn't find were worth the added complexity. The far-distance limitation is measurable: for pixels where GT was greater than 30m, DPT-Large predicted an average of 3-7m after alignment. This is a fundamental constraint of single-scale alignment on sparse GT rather than a tunable parameter.
+
+### 4.6 Inference details
+
+After running the model, the output is interpolated back to the original image size since DPT internally processes at 384x384:
+
+```python
+prediction = torch.nn.functional.interpolate(
+    prediction.unsqueeze(1),
+    size=img_rgb.shape[:2],
+    mode='bicubic',
+    align_corners=False
+)
+```
+
+`unsqueeze(1)` adds a channel dimension because interpolate expects 4D input. `squeeze()` removes it after. `torch.no_grad()` is used throughout inference since gradients aren't needed.
+
+<img src="assets/depth_comparison_scene0.png" width="800">
+
+*All methods on scene 0. Top row: left image and GT depth. Middle row: StereoBM and StereoSGBM. Bottom row: DPT-Large and DepthAnything V2. Stereo methods have white invalid regions, while neural methods are fully dense. The plasma colormap uses vmin=0, vmax=80 consistently across all methods so colors are directly comparable.*
+
+---
+
+parts 5-12 coming very soon, stay tuned!
